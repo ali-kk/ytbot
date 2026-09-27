@@ -177,8 +177,8 @@ sudo rm -f /tmp/yttest.*
 **Check:** it ends with `[download] 100% ...`.
 
 **If WARP cannot be installed** (unsupported OS/CPU) and Step 6 downloaded fine, you can skip WARP:
-delete the proxy line with `sudo -H -u ytbot sed -i '/^YT_PROXY=/d' /opt/ytbot/.env`. Tell the human
-that the bot may stop working if YouTube blocks the server later.
+run `sudo -H -u ytbot sed -i 's#^YT_PROXY=.*#YT_PROXY=direct#' /opt/ytbot/.env`. Tell the human
+that the bot may stop working if YouTube blocks the server later (see [Handling lots of users](#handling-lots-of-users-avoiding-youtube-blocks)).
 
 ### Step 8: Start the bot as a service
 
@@ -210,7 +210,7 @@ While they test, watch the log:
 sudo journalctl -u ytbot -f
 ```
 
-Press `Ctrl+C` to stop watching. A line like `proxy failed, retrying direct` is only a warning and
+Press `Ctrl+C` to stop watching. A line like `route 1/2 failed, trying next` is only a warning and
 is fine as long as the song arrives.
 
 **Done.** The bot now starts by itself after reboots and restarts itself if it crashes.
@@ -235,7 +235,7 @@ is fine as long as the song arrives.
 |---|---|---|
 | `Conflict: terminated by other getUpdates request` | The same token runs somewhere else. | Stop the other copy (another server, a laptop). Only one may run. |
 | `Unauthorized` or `InvalidToken` | Wrong token in `.env`. | Redo Step 5. If the token leaked, send `/revoke` to @BotFather and use the new one. |
-| `Sign in to confirm you're not a bot` | YouTube blocks the IP. | Make sure Step 7 passed and `.env` has the `YT_PROXY=` line, then restart. If it started right after many downloads in a short time, stop testing and wait a few hours: it usually clears by itself. If WARP is blocked too, get a residential SOCKS5/HTTP proxy and put its URL in `YT_PROXY=` (e.g. `YT_PROXY=http://user:pass@host:port`). |
+| `Sign in to confirm you're not a bot` (songs fail, search still works) | YouTube blocks the IPs the bot uses. | Make sure Step 7 passed. If it started right after many downloads in a short time, stop testing and wait a few hours: it usually clears by itself. For a lasting fix, add residential proxies: see [Handling lots of users](#handling-lots-of-users-avoiding-youtube-blocks). |
 | `No supported JavaScript runtime` / `n challenge solving failed` | `deno` is missing from the bot's PATH. | `sudo -H -u ytbot /opt/ytbot/venv/bin/pip install deno`, then check `/opt/ytbot/venv/bin/deno` exists and restart. |
 | `ffprobe/ffmpeg not found` | ffmpeg not installed. | `sudo apt-get install -y ffmpeg`, then restart. |
 | Bot replies `الملف كبير جداً أو بث مباشر` | The video is longer than 20 minutes, bigger than 50 MB, or a live stream. Telegram bots cannot send files over 50 MB. | Normal. Pick a shorter video. |
@@ -243,6 +243,46 @@ is fine as long as the song arrives.
 | Downloads suddenly fail for every song | YouTube changed something and `yt-dlp` is outdated. | `sudo systemctl restart ytbot` (it updates `yt-dlp` on every start). |
 | `status=203/EXEC` or `217/USER` in `systemctl status ytbot` | Wrong paths or the `ytbot` user is missing. | Redo Steps 3–4. The service needs exactly `/opt/ytbot` and user `ytbot`. |
 | `warp-cli: command not found` | WARP not installed. | Redo Step 7, or skip it as described there. |
+
+## Handling lots of users (avoiding YouTube blocks)
+
+YouTube limits how much one IP address can download. When an IP is over the limit, the log shows
+`Sign in to confirm you're not a bot`: songs fail, but search usually still works. A block lasts hours.
+
+- YouTube's limit is about **300 songs per hour per IP**. Server (datacenter) IPs and Cloudflare WARP get
+  blocked much sooner than that, especially by bursts (many downloads within a few minutes).
+- The bot already protects itself:
+  - A song sent once is re-sent from Telegram's cache: no YouTube request at all.
+  - At most 3 downloads run at the same time (`DOWNLOADS` in `bot.py`), so a rush of users does not become a burst.
+  - Requests rotate over all routes in `YT_PROXY`. A route that gets blocked moves to the back and is only
+    used when the others fail; once it works again it rejoins the rotation.
+  - `yt-dlp` is updated every day.
+- **Small bot (you, friends, one group):** the default `YT_PROXY=socks5://127.0.0.1:40000,direct` is usually enough.
+- **Many users:** add **rotating residential proxies**. They are paid (usually a few USD per GB; one song is
+  about 4 MB, so roughly 250 songs per GB). Datacenter proxies and free proxy lists do not work: YouTube
+  already blocks them, and free proxies can be unsafe.
+
+How to add residential proxies (for the AI agent):
+
+1. The human buys a **rotating residential proxy** plan that supports **sticky sessions** and gives you the
+   proxy host, port, username and password.
+2. In the provider's docs, find the sticky-session format. Usually a session id goes inside the username,
+   for example `myuser-session-abc123`. Replace the id with the literal text `{session}`. The bot puts a new
+   random id there for every song, so every song gets a fresh IP, while all requests for one song share the
+   same IP (YouTube requires that).
+3. Put the proxy first in `YT_PROXY`, keeping WARP and direct as fallbacks. Replace `USER`, `PASS`, `HOST`,
+   `PORT`, and keep `{session}` exactly as written:
+
+   ```bash
+   sudo -H -u ytbot sed -i 's#^YT_PROXY=.*#YT_PROXY=http://USER-session-{session}:PASS@HOST:PORT,socks5://127.0.0.1:40000,direct#' /opt/ytbot/.env
+   sudo systemctl restart ytbot
+   ```
+
+   If the username or password contains `@`, `#`, `,` or `&`, write them URL-encoded: `%40`, `%23`, `%2C`, `%26`.
+   Several proxies (even from different providers) can be listed, separated by commas; the bot spreads
+   songs across all of them.
+4. Ask the human to send one song. In `sudo journalctl -u ytbot -n 20 --no-pager` there must be no
+   `route 1/3 failed` line. The proxy password is never written to the log.
 
 ## Customizing (optional)
 
@@ -263,4 +303,4 @@ The bot's replies are in Iraqi Arabic. To change them, edit the Arabic text stri
 - Live streams and videos over 20 minutes are refused **before** downloading.
 - Cache: after a song is sent once, Telegram gives the bot an ID for that file. The bot saves it in `/opt/ytbot/sent_cache*` and next time re-sends the same file by ID, with no download or upload, in under a second. Deleting `sent_cache*` is safe; songs just get downloaded again.
 - Many users are served at the same time; one slow download does not block others.
-- Every YouTube request goes through `YT_PROXY` first; if that fails, it retries with the server's own IP.
+- Every YouTube request goes through one of the routes in `YT_PROXY` (rotating); if it fails, the next route is tried. See [Handling lots of users](#handling-lots-of-users-avoiding-youtube-blocks).

@@ -5,9 +5,11 @@ and ~2x faster than converting to MP3. Telegram plays M4A in its music player li
 """
 import asyncio
 import html
+import itertools
 import logging
 import os
 import re
+import secrets
 import shelve
 import tempfile
 from pathlib import Path
@@ -27,10 +29,20 @@ from yt_dlp.utils import match_filter_func
 RESULTS = 6
 MAX_DURATION = 20 * 60  # Telegram bots cannot upload past 50 MB
 MAX_BYTES = 49 * 1024 * 1024
-PROXY = os.environ.get("YT_PROXY")  # e.g. socks5://127.0.0.1:40000 (Cloudflare WARP)
 LINK = re.compile(r"(?:youtube\.com/(?:watch\?\S*?v=|shorts/|live/|embed/)|youtu\.be/)([\w-]{11})")
 # video id -> Telegram file_id: a song sent once is re-sent instantly, no download or upload.
 SENT = {}  # main() swaps in the on-disk cache (it is locked while open, so not at import)
+
+# YouTube bot-checks IPs that send too much ("Sign in to confirm you're not a bot"), fastest for
+# server IPs. So requests rotate over several routes: proxy URLs and/or "direct" (comma-separated).
+# "{session}" in a proxy URL becomes a random id per request: sticky-session residential proxies
+# then give every song a fresh IP.
+ROUTES = [r.strip() for r in os.environ.get("YT_PROXY", "direct").split(",") if r.strip()]
+# Errors that mean "this route is blocked or unreachable" (not "this video is broken").
+BLOCK_SIGNS = ("not a bot", "HTTP Error 403", "HTTP Error 429", "try again later", "TransportError")
+blocked_at, used_at = {}, {}  # route -> tick; blocked routes sink to the back until they work again
+tick = itertools.count(1)
+DOWNLOADS = asyncio.Semaphore(3)  # parallel downloads; bursts from one IP get it flagged
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)  # its INFO lines contain the bot token
@@ -38,16 +50,23 @@ log = logging.getLogger("ytbot")
 
 
 def extract(opts, url, download):
-    """Via proxy (YouTube bot-checks server IPs), retried once as YouTube 403s now and then; direct IP last."""
-    routes = [PROXY, PROXY, None] if PROXY else [None, None]
-    for attempt, proxy in enumerate(routes, 1):
+    """Try each route once: never-blocked first, then least recently used (spreads load over IPs)."""
+    routes = sorted(ROUTES, key=lambda r: (blocked_at.get(r, 0), used_at.get(r, 0)))
+    for n, route in enumerate(routes, 1):
+        used_at[route] = next(tick)
+        proxy = None if route == "direct" else route.replace("{session}", secrets.token_hex(6))
         try:
             with YoutubeDL({**opts, "proxy": proxy} if proxy else opts) as ydl:
-                return ydl.extract_info(url, download=download)
+                info = ydl.extract_info(url, download=download)
+            blocked_at.pop(route, None)
+            return info
         except Exception as e:
-            if attempt == len(routes):
+            if any(s in str(e) for s in BLOCK_SIGNS):
+                blocked_at[route] = next(tick)
+            if n == len(routes):
                 raise
-            log.warning("attempt %d/%d failed: %s", attempt, len(routes), e)
+            error = re.sub(r"//[^/@\s]+@", "//***@", str(e))[:200]  # hide proxy passwords
+            log.warning("route %d/%d failed, trying next: %s", n, len(routes), error)
 
 
 def human(n):
@@ -106,7 +125,8 @@ async def send_audio(msg, video_id):
 
     with tempfile.TemporaryDirectory() as folder:
         try:
-            path, info = await asyncio.to_thread(fetch_audio, video_id, folder)
+            async with DOWNLOADS:
+                path, info = await asyncio.to_thread(fetch_audio, video_id, folder)
         except Exception:
             log.exception("download failed")
             return await msg.reply_text("فشل التحميل.")
