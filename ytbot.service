@@ -1,0 +1,22 @@
+[Unit]
+Description=ytbot Telegram YouTube audio bot
+After=network-online.target warp-svc.service
+Wants=network-online.target
+
+[Service]
+User=ytbot
+WorkingDirectory=/opt/ytbot
+EnvironmentFile=/opt/ytbot/.env
+Environment=PATH=/opt/ytbot/venv/bin:/usr/local/bin:/usr/bin:/bin
+# YouTube breaks old yt-dlp often: upgrade on every start, restart daily so that happens.
+ExecStartPre=-/opt/ytbot/venv/bin/pip install -q -U "yt-dlp[default]"
+ExecStart=/opt/ytbot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+RuntimeMaxSec=1d
+TimeoutStartSec=5min
+# Per-download temp folders stay private to the service.
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
